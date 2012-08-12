@@ -46,6 +46,9 @@
 # include "zlib.h"
 #endif
 
+
+#include "Zend/zend_API.h"
+
 ZEND_DECLARE_MODULE_GLOBALS(couchbase)
 
 static int le_couchbase;
@@ -1195,15 +1198,181 @@ php_couchbase_stat_callback(libcouchbase_t handle,
 }
 /* }}} */
 
+
+struct php_couchbase_nodeinfo_st;
+
+struct php_couchbase_nodeinfo_st {
+    struct php_couchbase_nodeinfo_st *next;
+    char *host;
+    php_url *url;
+};
+
+struct php_couchbase_connparams_st {
+    struct php_couchbase_nodeinfo_st *nodes;
+    struct php_couchbase_nodeinfo_st *tail;
+
+    char *host_string;
+    char *bucket;
+    char *username;
+    char *password;
+};
+
+static int php_couchbase_parse_host(const char *host,
+                                       size_t host_len,
+                                       struct php_couchbase_connparams_st *cparams)
+{
+    php_url *url = NULL;
+    struct php_couchbase_nodeinfo_st *curnode;
+    curnode = ecalloc(1, sizeof(*curnode));
+
+    if (!cparams->tail) {
+        cparams->nodes = cparams->tail = curnode;
+    } else {
+        cparams->tail->next = curnode;
+        cparams->tail = curnode;
+    }
+
+
+    if (strncasecmp(host, "http://", sizeof("http://") - 1) != 0
+                    && strncasecmp(host, "https://", sizeof("https://") - 1)
+                    != 0)
+    {
+        /* simple host string */
+        curnode->host = ecalloc(1, host_len + 1);
+        memcpy(curnode->host, host, host_len);
+        curnode->host[host_len] = '\0';
+        return 1;
+    }
+
+
+    if (!(url = php_url_parse_ex(host, host_len))) {
+        php_error_docref(NULL TSRMLS_CC, E_WARNING, "malformed host url %s", host);
+        return 0;
+    }
+
+    if (!url->host) {
+        php_url_free(url);
+        php_error_docref(NULL TSRMLS_CC, E_WARNING, "malformed host url %s", host);
+        return 0;
+    }
+
+    curnode->url = url;
+    return 1;
+}
+
+static int _append_host_port(char *oldstr, char **newstr,
+                             const char *host,
+                             unsigned short port)
+{
+    if (oldstr) {
+        if (port) {
+            return spprintf(newstr, 0, "%s;%s:%d", oldstr, host, port);
+        } else {
+            return spprintf(newstr, 0, "%s;%s", oldstr, host);
+        }
+    } else {
+        if (port) {
+            return spprintf(newstr, 0, "%s:%d", host, port);
+        } else {
+            return spprintf(newstr, 0, "%s", host);
+        }
+    }
+}
+
+static int php_couchbase_make_params(struct php_couchbase_connparams_st *cparams)
+{
+    struct php_couchbase_nodeinfo_st *ni;
+    char *curstr = NULL;
+    int curlen;
+
+    for (ni = cparams->nodes; ni; ni = ni->next) {
+
+        char *newstr = NULL;
+        char *curhost;
+
+        if (ni->url) {
+
+            _append_host_port(curstr, &newstr, ni->url->host, ni->url->port);
+
+            if (cparams->username == NULL) {
+                cparams->username = ni->url->user;
+            }
+
+            if (cparams->password == NULL) {
+                cparams->password = ni->url->pass;
+            }
+
+            if (cparams->bucket == NULL && ni->url->path != NULL && ni->url->path[0] == '/') {
+
+                char *bucket = ni->url->path;
+                int i=0, j = strlen(bucket);
+
+                if (*(bucket + j - 1) == '/') {
+                    *(bucket + j - 1) = '\0';
+                }
+
+                for(;i<j;i++) {
+                    bucket[i] = bucket[i+1];
+                }
+
+                cparams->bucket = bucket;
+            }
+
+        } else {
+            _append_host_port(curstr, &newstr, ni->host, 0);
+        }
+
+        efree(curstr);
+        curstr = newstr;
+    }
+
+    cparams->host_string = curstr;
+}
+
+static void php_couchbase_free_connparams(
+        struct php_couchbase_connparams_st *cparams)
+{
+    struct php_couchbase_nodeinfo_st *ni = cparams->nodes;
+    while (ni) {
+
+        struct php_couchbase_nodeinfo_st *next = ni->next;
+        if (ni->url) {
+            php_url_free(ni->url);
+        } else if (ni->host) {
+            efree(ni->host);
+        }
+
+        efree(ni);
+        ni = next;
+    }
+
+    if (cparams->host_string) {
+        efree(cparams->host_string);
+    }
+}
+
+
+/**
+ * We need to
+ */
+
+
 /* internal implementions */
 static void php_couchbase_create_impl(INTERNAL_FUNCTION_PARAMETERS, int oo) /* {{{ */ {
-	char *host;
 	char *user = NULL, *passwd = NULL, *bucket = NULL;
-	int host_len, user_len, passwd_len, bucket_len;
+	int host_len = 0, user_len = 0, passwd_len = 0, bucket_len = 0;
 	zend_bool persistent = 0;
+	zval *zvhosts = NULL;
+	struct php_couchbase_connparams_st cparams;
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|sssb",
-				&host, &host_len, &user, &user_len, &passwd, &passwd_len, &bucket, &bucket_len, &persistent) == FAILURE) {
+	memset(&cparams, 0, sizeof(cparams));
+
+	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "z|sssb",
+				&zvhosts,
+				&user, &user_len,
+				&passwd, &passwd_len,
+				&bucket, &bucket_len,
+				&persistent) == FAILURE) {
 		return;
 	} else {
 		libcouchbase_t handle;
@@ -1211,48 +1380,68 @@ static void php_couchbase_create_impl(INTERNAL_FUNCTION_PARAMETERS, int oo) /* {
 		libcouchbase_io_opt_t *iops;
 		php_couchbase_res *couchbase_res;
 		php_couchbase_ctx *ctx;
-		php_url *url = NULL;
 		char *hashed_key;
 		uint hashed_key_len = 0;
 
-		if (ZEND_NUM_ARGS() == 1 && (strncasecmp(host, "http://", sizeof("http://") - 1) == 0
-				|| strncasecmp(host, "https://", sizeof("https://") - 1) == 0)) {
-
-			 if (!(url = php_url_parse_ex(host, host_len))) {
-				 php_error_docref(NULL TSRMLS_CC, E_WARNING, "malformed host url %s", host);
-				 RETURN_FALSE;
-			 }
-
-			 if (url->host) {
-				 host = url->host;
-				 if (url->port) {
-					spprintf(&host, 0, "%s:%d", host, url->port);
-					efree(url->host);
-					url->host = host;
-				 }
-			 } else {
-				 php_url_free(url);
-				 php_error_docref(NULL TSRMLS_CC, E_WARNING, "malformed host url %s", host);
-				 RETURN_FALSE;
-			 }
-
-			 user = url->user;
-			 passwd = url->pass;
-			 bucket = url->path;
-			 if (*bucket == '/') {
-				 int i=0, j = strlen(bucket);
-				 if (*(bucket + j - 1) == '/') {
-					 *(bucket + j - 1) = '\0';
-				 }
-				 for(;i<j;i++) {
-					 bucket[i] = bucket[i+1];
-				 }
-			 }
+		if (ZEND_NUM_ARGS() >= 4) {
+		    if (bucket_len) {
+		        cparams.bucket = bucket;
+		    }
+		    if (user_len) {
+		        cparams.username = user;
+		    }
+		    if (passwd_len) {
+		        cparams.password = passwd;
+		    }
 		}
+
+		if (Z_TYPE_P(zvhosts) == IS_STRING) {
+		    if (!php_couchbase_parse_host(
+		            Z_STRVAL_P(zvhosts), Z_STRLEN_P(zvhosts), &cparams)) {
+		        php_couchbase_free_connparams(&cparams);
+		        RETURN_FALSE;
+		    }
+		} else if (Z_TYPE_P(zvhosts) == IS_ARRAY) {
+		    int nhosts;
+		    zval **curzv = NULL;
+		    HashTable *hthosts = Z_ARRVAL_P(zvhosts);
+		    HashPosition htpos;
+		    int ii;
+		    nhosts = zend_hash_num_elements(hthosts);
+
+		    for (ii = 0, zend_hash_internal_pointer_reset_ex(hthosts, &htpos);
+		            ii < nhosts &&
+		            zend_hash_get_current_data_ex(hthosts, (void**)&curzv, &htpos) == SUCCESS;
+		            zend_hash_move_forward_ex(hthosts, &htpos), ii++) {
+		        if (!Z_TYPE_PP(curzv) == IS_STRING) {
+
+		            php_error_docref(NULL TSRMLS_CC, E_WARNING,
+		                             "Couldn't get string from node lists");
+		            php_couchbase_free_connparams(&cparams);
+		            RETURN_FALSE;
+		        }
+		        if (!php_couchbase_parse_host(Z_STRVAL_PP(curzv),
+		                                      Z_STRLEN_PP(curzv),
+		                                      &cparams)) {
+		            php_couchbase_free_connparams(&cparams);
+		            RETURN_FALSE;
+		        }
+		    }
+
+		} else {
+		    php_error_docref(NULL TSRMLS_CC, E_WARNING,
+		                     "Hosts is neither a string nor an array");
+		    php_couchbase_free_connparams(&cparams);
+		    RETURN_FALSE;
+		}
+
+        php_couchbase_make_params(&cparams);
+
 
 		if (persistent) {
 			zend_rsrc_list_entry *le;
-			hashed_key_len = spprintf(&hashed_key, 0, "couchbase_%s_%s_%s_%s", host, user, passwd, bucket);
+			hashed_key_len = spprintf(&hashed_key, 0, "couchbase_%s_%s_%s_%s",
+			                          cparams.host_string, user, passwd, bucket);
 			if (zend_hash_find(&EG(persistent_list), hashed_key, hashed_key_len + 1, (void **) &le) == FAILURE) {
 				goto create_new_link;
 			}
@@ -1266,22 +1455,33 @@ static void php_couchbase_create_impl(INTERNAL_FUNCTION_PARAMETERS, int oo) /* {
 create_new_link:
 			iops = libcouchbase_create_io_ops(LIBCOUCHBASE_IO_OPS_DEFAULT, NULL, NULL);
 			if (!iops) {
-				if (url) {
-					php_url_free(url);
-				}
+			    php_couchbase_free_connparams(&cparams);
 				php_error_docref(NULL TSRMLS_CC, E_WARNING, "failed to create IO instance");
 				RETURN_FALSE;
 			}
 
-			if (!bucket) {
-				bucket = "default";
+			if (!cparams.bucket) {
+			    cparams.bucket = "default";
 			}
 
-			handle = libcouchbase_create(host, user, passwd, bucket, iops);
+//			printf("Host string: %s\n", cparams.host_string);
+//			if (cparams.username) {
+//			    printf("Username: %s\n", cparams.username);
+//			}
+//			if (cparams.password) {
+//			    printf("Password: %s\n", cparams.password);
+//			}
+//			if (cparams.bucket) {
+//			    printf("Bucket: %s\n", cparams.bucket);
+//			}
+//			printf("Host string: %s\n", cparams.host_string);
+			handle = libcouchbase_create(cparams.host_string,
+			                             cparams.username,
+			                             cparams.password,
+			                             cparams.bucket,
+			                             iops);
 			if (!handle) {
-				if (url) {
-					php_url_free(url);
-				}
+			    php_couchbase_free_connparams(&cparams);
 				php_error_docref(NULL TSRMLS_CC, E_WARNING, "Failed to create libcouchbase instance");
 				RETURN_FALSE;
 			}
@@ -1289,9 +1489,7 @@ create_new_link:
 			php_ignore_value(libcouchbase_set_error_callback(handle, php_couchbase_error_callback));
 
 			if (LIBCOUCHBASE_SUCCESS != (retval = libcouchbase_connect(handle))) {
-				if (url) {
-					php_url_free(url);
-				}
+			    php_couchbase_free_connparams(&cparams);
 				php_error_docref(NULL TSRMLS_CC, E_WARNING,
 						"Failed to connect libcouchbase to server: %s", libcouchbase_strerror(handle, retval));
 				RETURN_FALSE;
@@ -1321,9 +1519,7 @@ create_new_link:
 
 			couchbase_res->seqno = 0;
 			if (LIBCOUCHBASE_SUCCESS != (retval = libcouchbase_get_last_error(handle))) {
-				if (url) {
-					php_url_free(url);
-				}
+			    php_couchbase_free_connparams(&cparams);
 				php_error_docref(NULL TSRMLS_CC, E_WARNING,
 						"Failed to connect libcouchbase to server: %s", libcouchbase_strerror(handle, retval));
 				libcouchbase_destroy(handle);
@@ -1337,9 +1533,7 @@ create_new_link:
 				Z_TYPE(le) = le_pcouchbase;
 				le.ptr = couchbase_res;
 				if (zend_hash_update(&EG(persistent_list), hashed_key, hashed_key_len + 1, (void *) &le, sizeof(zend_rsrc_list_entry), NULL) == FAILURE) {
-					if (url) {
-						php_url_free(url);
-					}
+				    php_couchbase_free_connparams(&cparams);
 					php_error_docref(NULL TSRMLS_CC, E_WARNING, "Failed to store persistent link");
 				}
 				efree(hashed_key);
@@ -1352,10 +1546,7 @@ create_new_link:
 			zval *self = getThis();
 			zend_update_property(couchbase_ce, self, ZEND_STRL(COUCHBASE_PROPERTY_HANDLE), return_value TSRMLS_CC);
 		}
-
-		if (url) {
-			php_url_free(url);
-		}
+		php_couchbase_free_connparams(&cparams);
 		efree(ctx);
 	}
 }

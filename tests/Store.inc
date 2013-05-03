@@ -261,4 +261,18 @@ class Store extends CouchbaseTestCommon {
 			$this->assertEquals($v, $keys[$k]);
 		}
 	}
+
+    function testSetMulti_PCBC227() {
+        $oo = $this->oo;
+        $keys = array();
+        for ($i = 0; $i < 3; $i++) {
+            $keys[$i] = $i;
+        }
+
+        $oo->setMulti($keys);
+        foreach (array_keys($keys) as $k) {
+            $v = $oo->get($k);
+            $this->assertEquals($k, $v);
+        }
+    }
 }

@@ -669,25 +669,13 @@ void php_couchbase_store_multi_impl_oo(INTERNAL_FUNCTION_PARAMETERS)
 		char *payload;
 		unsigned int flags = 0;
 		zval **ppzval;
+		ulong kidx;
 
-		if (zend_hash_get_current_key_type(Z_ARRVAL_P(akeys)) != HASH_KEY_IS_STRING) {
-			int xx;
-			for (xx = 0; xx < ii; ++xx) {
-				efree((void *)cmds[xx].v.v0.bytes);
-			}
-			efree(commands);
-			efree(cmds);
-			efree(ctx);
-			release_entry_array(entries,  xx);
+		int ktype = zend_hash_get_current_key_type(Z_ARRVAL_P(akeys));
 
-			zend_throw_exception(cb_illegal_key_exception,
-								 "Invalid key specified (not a string)",
-								 0 TSRMLS_CC);
-			return ;
-		}
+		zend_hash_get_current_key(Z_ARRVAL_P(akeys), &key, &kidx, 0);
 
-		zend_hash_get_current_key(Z_ARRVAL_P(akeys), &key, NULL, 0);
-		if ((klen = strlen(key)) == 0) {
+		if (ktype == HASH_KEY_IS_STRING && (klen = strlen(key)) == 0) {
 			int xx;
 			for (xx = 0; xx < ii; ++xx) {
 				efree((void *)cmds[xx].v.v0.bytes);
@@ -730,6 +718,10 @@ void php_couchbase_store_multi_impl_oo(INTERNAL_FUNCTION_PARAMETERS)
 			RETURN_FALSE;
 		}
 
+		if (ktype == HASH_KEY_IS_LONG) {
+			klen = spprintf(&key, 0, "%llu", kidx);
+		}
+
 		if (couchbase_res->prefix_key_len) {
 			char *new_key;
 			klen = spprintf(&new_key, 0, "%s_%s", couchbase_res->prefix_key, key);
@@ -747,7 +739,7 @@ void php_couchbase_store_multi_impl_oo(INTERNAL_FUNCTION_PARAMETERS)
 		cmds[ii].v.v0.flags = flags;
 		cmds[ii].v.v0.exptime = exp;
 
-		if (couchbase_res->prefix_key_len) {
+		if (couchbase_res->prefix_key_len || ktype == HASH_KEY_IS_LONG) {
 			efree(key);
 		}
 	}
